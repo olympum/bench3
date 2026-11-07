@@ -95,6 +95,7 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--summary", action="store_true")
     ap.add_argument("--task", action="append", default=[], help="limit to these imported tasks")
+    ap.add_argument("--effort", default="high", help="effort passed to the harness; default leaves it to the harness")
     a = ap.parse_args()
     if a.summary:
         summary()
@@ -114,13 +115,13 @@ def main() -> int:
             if token_billed and spent_usd() >= a.max_usd:
                 print("ceiling reached, skipping %s %s rep %d" % job, flush=True)
                 return
-        effort = config["routes"][route_id].get("effort") or "high"
+        effort = config["routes"][route_id].get("effort") or a.effort
         stem = "%s_%s_%s_rep%d" % (route_id, task.replace("/", "-"), effort, rep)
         prior = RESULTS / (stem + ".json")
         if prior.exists() and json.loads(prior.read_text())["valid"]:
             return
         try:
-            run_one(config, route_id, "high", task, rep, a.limit, True)  # an invalid earlier record is replaced
+            run_one(config, route_id, a.effort, task, rep, a.limit, True)  # an invalid earlier record is replaced
         except Exception as exc:  # a provider or harness failure is recorded and the probe moves on
             print("FAILED %s %s rep %d: %s" % (route_id, task, rep, exc), flush=True)
 

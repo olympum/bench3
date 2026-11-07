@@ -418,7 +418,7 @@ def arm_command(route: dict[str, Any], effort: str, prompt: str, root: Path) -> 
     cmd = ["claude", "-p", prompt, "--model", model, "--setting-sources", "project,local", "--strict-mcp-config",
            "--permission-mode", "bypassPermissions", "--output-format", "stream-json", "--verbose"]
     effort = route.get("effort") or effort
-    if effort:
+    if effort and effort != "default":  # "default" leaves effort to Claude Code, as a user would
         cmd += ["--effort", effort]
     if route.get("gateway"):
         env.update({"ANTHROPIC_BASE_URL": GATEWAY_URL, "ANTHROPIC_API_KEY": GATEWAY_TOKEN.read_text().strip()})
@@ -556,7 +556,9 @@ def run_one_arm(
         if not parsed["models"] or any(not m.startswith(route["model"]) for m in parsed["models"]):
             evidence.append("parent served by %s, not only %s" % (parsed["models"], route["model"]))
     else:
-        if not gw or not gw["dispatches"]:
+        # A fully escalated turn may make no LunaRoute call: the gateway answers with its own tool call and then
+        # passes the child's result through (ADR 0015's "or is the gateway's own tool call").
+        if not gw or (not gw["dispatches"] and not children):
             evidence.append("no gateway dispatch recorded for the run")
         elif any(not k.startswith("lunaroute/") for k in gw["dispatches"]):
             evidence.append("gateway dispatched outside LunaRoute: %s" % gw["dispatches"])
@@ -564,15 +566,15 @@ def run_one_arm(
             evidence.append("gateway served %s, not %s" % (gw["dispatches"], route["model"]))
         if not route.get("escalate") and children:
             evidence.append("escalation in an arm without the escalate tool")
-        if route.get("escalate") and any(m and not m.startswith(route["escalate_model"]) for m in child_models):
+        if route.get("escalate") and any(m and m != "None" and not m.startswith(route["escalate_model"]) for m in child_models):
             evidence.append("child served by %s, not %s" % (child_models, route["escalate_model"]))
-    child_usage = {"input": 0, "cached": 0, "cache_write": 0, "output": 0}
+    # aegis escalate-mcp (#4419) returns flat fields: input_tokens, cached_tokens, output_tokens, cost_usd, outcome.
+    child_usage = {"input": 0, "cached": 0, "cache_write": 0, "output": 0, "reported_usd": 0.0}
     for c in children:
-        u = c.get("usage") or {}
-        child_usage["input"] += u.get("input_tokens", 0)
-        child_usage["cached"] += u.get("cache_read_input_tokens", 0)
-        child_usage["cache_write"] += u.get("cache_creation_input_tokens", 0)
-        child_usage["output"] += u.get("output_tokens", 0)
+        child_usage["input"] += c.get("input_tokens") or 0
+        child_usage["cached"] += c.get("cached_tokens") or 0
+        child_usage["output"] += c.get("output_tokens") or 0
+        child_usage["reported_usd"] += c.get("cost_usd") or 0.0
     raw = parsed["usage"]
     usage = {"input_tokens": raw["input"] + raw["cached"] + raw["cache_write"], "cache_read_tokens": raw["cached"],
              "cache_write_tokens": raw["cache_write"], "output_tokens": raw["output"], "reasoning_tokens": 0,
@@ -581,7 +583,9 @@ def run_one_arm(
         costs = {"billing": "user-subscription", "cash_cost_usd": 0.0, "api_equivalent_usd": price(raw, route["prices"])}
     else:
         costs = {"billing": "subscription", "cash_cost_usd": 0.0, "capacity_allocated_cost_usd": 0.0,
-                 "escalation_api_equivalent_usd": price(child_usage, route["escalate_prices"]) if route.get("escalate") else 0.0}
+                 # The child's own Claude Code figure counts cache writes, which escalate-mcp does not report.
+                 "escalation_api_equivalent_usd": (child_usage["reported_usd"] or price(child_usage, route["escalate_prices"]))
+                 if route.get("escalate") else 0.0}
     result_grade = grade(task_dir, work)
     if evidence:
         result_grade["passed"] = False
@@ -598,7 +602,9 @@ def run_one_arm(
         "condition": "base", "elapsed_seconds": elapsed, "exit_code": exit_code, "timed_out": timed_out,
         "sandbox_enforced": True, "valid": not evidence, "leak_evidence": evidence, "usage": usage, "costs": costs,
         "cost_source": "tokens-at-list-price", "parent_models": parsed["models"],
-        "gateway": gw, "escalations": [{k: c.get(k) for k in ("status", "model", "backend", "session", "usage")} for c in children],
+        "gateway": gw, "escalations": [{k: c.get(k) for k in ("outcome", "model", "backend", "effort", "mode", "session_id",
+                                                              "input_tokens", "cached_tokens", "output_tokens", "cost_usd",
+                                                              "duration_ms", "raw")} for c in children],
         "escalation_usage": child_usage, "grade": result_grade, "record_path": str(record_path),
         "log_path": str(log_path), "artifact_path": str(artifact_path),
     }
