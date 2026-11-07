@@ -412,3 +412,85 @@ routes:
     credit_fee_percent: 5.5
     prices: {input: 10.00, cached_input: 0.25, cache_write: 12.50, output: 50.00}
 
+  # ADR 0015's arms (mithran-hq/aegis-llm-proxy docs/adr/0015 and 0018), as PLG V1 runs them: the user's own
+  # Claude Code is the harness for every arm. Gateway arms point it at a local gateway built from landed
+  # aegis-llm-proxy source (BENCH3_GATEWAY_URL); escalation runs aegis escalate-mcp, whose child is an
+  # unmodified claude -p on the user's own login. No arm uses an Anthropic API key. Costs are token counts at
+  # the list prices below; lane-plan routes cost Mithran nothing per run. Agentic only.
+  opus-login:
+    enabled: false
+    agentic_only: true
+    arm: opus
+    model_family: claude-opus-5.5
+    display: Claude Opus 5.5 — Claude Code on the user's login
+    vendor: Anthropic
+    route: user login
+    provider: anthropic
+    harness: claude-code
+    model: claude-opus-5-5
+    effort: medium
+    billing: user-subscription
+    prices: {input: 4.00, cached_input: 0.20, cache_write: 5.00, output: 20.00}
+
+  nexus-gateway:
+    enabled: false
+    agentic_only: true
+    arm: nexus
+    model_family: mithran-nexus
+    display: Nexus — Claude Code on the gateway, escalation off
+    vendor: Mithran
+    route: Nexus gateway
+    provider: mithran
+    harness: claude-code
+    gateway: true
+    model: mithran/nexus
+    billing: subscription
+    plan: lunaroute-teams-10-40
+
+  nexus-escalate-gateway:
+    enabled: false
+    agentic_only: true
+    arm: nexus-escalate
+    model_family: mithran-nexus
+    display: Nexus — Claude Code on the gateway, escalation to Opus on the user's login
+    vendor: Mithran
+    route: Nexus gateway
+    provider: mithran
+    harness: claude-code
+    gateway: true
+    escalate: true
+    model: mithran/nexus
+    escalate_model: claude-opus-5-5
+    billing: subscription
+    plan: lunaroute-teams-10-40
+    escalate_prices: {input: 4.00, cached_input: 0.20, cache_write: 5.00, output: 20.00}
+
+  glm53-flash-gateway:
+    enabled: false
+    agentic_only: true
+    arm: model
+    model_family: glm-5.3-flash
+    display: GLM 5.3 Flash — Claude Code on the gateway
+    vendor: Z.ai
+    route: Nexus gateway
+    provider: lunaroute
+    harness: claude-code
+    gateway: true
+    model: lunaroute/glm-5.3-flash
+    billing: subscription
+    plan: lunaroute-teams-10-40
+
+  ds41-gateway:
+    enabled: false
+    agentic_only: true
+    arm: model
+    model_family: deepseek-v4.1-flash
+    display: DeepSeek V4.1 Flash — Claude Code on the gateway
+    vendor: DeepSeek
+    route: Nexus gateway
+    provider: lunaroute
+    harness: claude-code
+    gateway: true
+    model: lunaroute/deepseek-4.1-flash
+    billing: subscription
+    plan: lunaroute-teams-10-40

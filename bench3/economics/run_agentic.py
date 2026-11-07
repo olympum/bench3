@@ -230,6 +230,8 @@ def run_one(
     parent_record_path: str | None = None,
 ) -> dict[str, Any]:
     route = config["routes"][route_id]
+    if route.get("arm"):
+        return run_one_arm(config, route_id, effort, task, rep, limit, force)
     task_dir = BENCH / "tasks" / task
     prompt_path = task_dir / "PROMPT.txt"
     if not prompt_path.exists():
@@ -391,6 +393,220 @@ def run_one(
             cost_source,
         )
     )
+    return record
+
+
+GATEWAY_URL = os.environ.get("BENCH3_GATEWAY_URL", "http://127.0.0.1:18990")
+GATEWAY_TOKEN = Path(os.environ.get("BENCH3_GATEWAY_TOKEN_FILE", str(Path.home() / "nexeval-bench3" / ".gw-token")))
+GATEWAY_LOG = os.environ.get("BENCH3_GATEWAY_LOG", "")
+AEGIS_BIN = os.environ.get("BENCH3_AEGIS_BIN", str(Path.home() / "nexeval-bench3" / "aegis-src" / "target" / "release" / "aegis"))
+ESCALATE_TOOL = "mcp__aegis__escalate"
+
+
+def arm_command(route: dict[str, Any], effort: str, prompt: str, root: Path) -> tuple[list[str], dict[str, str]]:
+    """Claude Code as the user runs it under PLG V1 (ADR 0018), for one ADR 0015 arm.
+
+    Every arm loads only project and local settings, so the user's own CLAUDE.md, hooks and plugins stay out,
+    the same flags aegis escalate-mcp gives its child. Gateway arms point Claude Code at the gateway with every
+    model slot on the route's model; the escalate arm adds the escalate MCP server and declares its tool to the
+    gateway by header. The child that escalate-mcp starts runs on the user's own login: escalate-mcp strips the
+    gateway settings, and no API key is set.
+    """
+    model = route["model"]
+    env = {"DISABLE_TELEMETRY": "1", "ANTHROPIC_DEFAULT_HAIKU_MODEL": model, "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+           "ANTHROPIC_DEFAULT_OPUS_MODEL": model}
+    cmd = ["claude", "-p", prompt, "--model", model, "--setting-sources", "project,local", "--strict-mcp-config",
+           "--permission-mode", "bypassPermissions", "--output-format", "stream-json", "--verbose"]
+    effort = route.get("effort") or effort
+    if effort:
+        cmd += ["--effort", effort]
+    if route.get("gateway"):
+        env.update({"ANTHROPIC_BASE_URL": GATEWAY_URL, "ANTHROPIC_API_KEY": GATEWAY_TOKEN.read_text().strip()})
+    if route.get("escalate"):
+        mcp = {"mcpServers": {"aegis": {"type": "stdio", "command": AEGIS_BIN, "args": ["escalate-mcp"], "alwaysLoad": True,
+                                        "env": {"AEGIS_ESCALATE_MODEL": route["escalate_model"],
+                                                "AEGIS_ESCALATE_PERMISSION_MODE": "bypassPermissions",
+                                                "AEGIS_ESCALATE_MAX_SECONDS": os.environ.get("BENCH3_ESCALATE_MAX_SECONDS", "1800")}}}}
+        (root / "escalate-mcp.json").write_text(json.dumps(mcp))
+        cmd += ["--mcp-config", str(root / "escalate-mcp.json")]
+        env["ANTHROPIC_CUSTOM_HEADERS"] = "x-aegis-escalate-tool: " + ESCALATE_TOOL
+    return cmd, env
+
+
+def parse_stream(stdout: str) -> dict[str, Any]:
+    """Parent usage and models, escalate calls and their child results, from Claude Code's stream-json output."""
+    out = {"usage": {"input": 0, "cached": 0, "cache_write": 0, "output": 0}, "turns": 0, "models": set(),
+           "escalations": [], "result": {}}
+    calls = {}
+    for line in stdout.splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("type") == "assistant":
+            msg = e.get("message") or {}
+            out["models"].add(msg.get("model"))
+            for block in msg.get("content") or []:
+                if block.get("type") == "tool_use" and block.get("name") == ESCALATE_TOOL:
+                    calls[block.get("id")] = block.get("input")
+        elif e.get("type") == "user":
+            for block in (e.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
+                    text = block.get("content")
+                    text = " ".join(x.get("text", "") for x in text if isinstance(x, dict)) if isinstance(text, list) else str(text)
+                    structured = (e.get("tool_use_result") or {}) if isinstance(e.get("tool_use_result"), dict) else {}
+                    try:
+                        child = structured.get("structuredContent") or json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        child = {"raw": text[:2000]}
+                    out["escalations"].append(child)
+        elif e.get("type") == "result":
+            out["result"] = e
+            u = e.get("usage") or {}
+            out["usage"] = {"input": u.get("input_tokens", 0), "cached": u.get("cache_read_input_tokens", 0),
+                            "cache_write": u.get("cache_creation_input_tokens", 0), "output": u.get("output_tokens", 0)}
+            out["turns"] = e.get("num_turns", 0)
+            out["model_usage"] = e.get("modelUsage") or {}
+    out["models"] = sorted(m for m in out["models"] if m)
+    return out
+
+
+def gateway_window(start: float, end: float) -> dict[str, Any]:
+    """Upstream dispatches and usage the gateway logged in [start, end]: the route evidence for a gateway arm."""
+    seen = {"dispatches": {}, "input": 0, "output": 0, "classifier_calls": 0}
+    if not GATEWAY_LOG or not os.path.exists(GATEWAY_LOG):
+        return seen
+    for line in open(GATEWAY_LOG, errors="ignore"):
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = e.get("timestamp")
+        if not ts:
+            continue
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        if not start <= t <= end:
+            continue
+        if e.get("event") == "upstream_request_dispatched":
+            key = "%s/%s" % (e.get("provider"), e.get("target"))
+            seen["dispatches"][key] = seen["dispatches"].get(key, 0) + 1
+        elif e.get("event") == "aegis_usage_observation":
+            seen["input"] += e.get("input_tokens") or 0
+            seen["output"] += e.get("output_tokens") or 0
+        elif e.get("event") == "nexus_classifier_call":
+            seen["classifier_calls"] += 1
+    return seen
+
+
+def price(usage: dict[str, int], prices: dict[str, float]) -> float:
+    return (usage["input"] * prices["input"] + usage["cached"] * prices["cached_input"]
+            + usage.get("cache_write", 0) * prices.get("cache_write", prices["input"]) + usage["output"] * prices["output"]) / 1e6
+
+
+def run_one_arm(
+    config: dict[str, Any], route_id: str, effort: str, task: str, rep: int, limit: int, force: bool,
+) -> dict[str, Any]:
+    """One ADR 0015 arm on one task: the same task, file sandbox, credential scan and grader as run_one."""
+    route = config["routes"][route_id]
+    task_dir = BENCH / "tasks" / task
+    prompt = (task_dir / "PROMPT.txt").read_text()
+    stem = "%s_%s_%s_rep%d" % (route_id, task.replace("/", "-"), route.get("effort") or effort, rep)
+    record_path = ECON / "agentic_results" / (stem + ".json")
+    if record_path.exists() and not force:
+        print("skip existing: %s" % record_path)
+        return json.loads(record_path.read_text())
+
+    started = datetime.now(timezone.utc)
+    temp_root = Path(tempfile.mkdtemp(prefix="bench3-economics-"))
+    work = temp_root / "work"
+    shutil.copytree(task_dir, work)
+    hide_test_assets(work)
+    sandbox_profile = make_sandbox_profile(temp_root, work)
+    cmd, arm_env = arm_command(route, effort, prompt, temp_root)
+    creds = load_credentials()
+    env = {k: v for k, v in os.environ.items() if k not in creds and not k.startswith(("ANTHROPIC", "OPENAI", "CLAUDE_CODE"))}
+    env.update(arm_env)
+    log_path = ECON / "agentic_runs" / (stem + ".log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timed_out, stdout = False, ""
+    begin = time.time()
+    try:
+        result = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(sandbox_profile), *cmd], cwd=work, env=env,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=limit)
+        exit_code, stdout = result.returncode, result.stdout
+        log_path.write_text(result.stdout + "\n--- STDERR ---\n" + result.stderr)
+    except subprocess.TimeoutExpired as exc:
+        timed_out, exit_code = True, 124
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        log_path.write_text(stdout)
+    end = time.time()
+    elapsed = end - begin
+
+    evidence = []
+    secret_hits = credential_exposure([log_path, work], creds)
+    if secret_hits:
+        log_path.write_text("redacted: a stored credential value appeared in this run's output\n")
+        evidence.append("credential value in " + ", ".join(secret_hits))
+    parsed = parse_stream(stdout)
+    gw = gateway_window(begin, end + 5) if route.get("gateway") else None
+    children = parsed["escalations"]
+    child_models = sorted({str(c.get("model")) for c in children if c.get("model")})
+    # ADR 0015's routing evidence; a run without it is invalid, not a failure of the arm.
+    if route["arm"] == "opus":
+        if not parsed["models"] or any(not m.startswith(route["model"]) for m in parsed["models"]):
+            evidence.append("parent served by %s, not only %s" % (parsed["models"], route["model"]))
+    else:
+        if not gw or not gw["dispatches"]:
+            evidence.append("no gateway dispatch recorded for the run")
+        elif any(not k.startswith("lunaroute/") for k in gw["dispatches"]):
+            evidence.append("gateway dispatched outside LunaRoute: %s" % gw["dispatches"])
+        if route["arm"] == "model" and any(k != route["model"] for k in gw["dispatches"]):
+            evidence.append("gateway served %s, not %s" % (gw["dispatches"], route["model"]))
+        if not route.get("escalate") and children:
+            evidence.append("escalation in an arm without the escalate tool")
+        if route.get("escalate") and any(m and not m.startswith(route["escalate_model"]) for m in child_models):
+            evidence.append("child served by %s, not %s" % (child_models, route["escalate_model"]))
+    child_usage = {"input": 0, "cached": 0, "cache_write": 0, "output": 0}
+    for c in children:
+        u = c.get("usage") or {}
+        child_usage["input"] += u.get("input_tokens", 0)
+        child_usage["cached"] += u.get("cache_read_input_tokens", 0)
+        child_usage["cache_write"] += u.get("cache_creation_input_tokens", 0)
+        child_usage["output"] += u.get("output_tokens", 0)
+    raw = parsed["usage"]
+    usage = {"input_tokens": raw["input"] + raw["cached"] + raw["cache_write"], "cache_read_tokens": raw["cached"],
+             "cache_write_tokens": raw["cache_write"], "output_tokens": raw["output"], "reasoning_tokens": 0,
+             "total_tokens": raw["input"] + raw["cached"] + raw["cache_write"] + raw["output"], "calls": parsed["turns"]}
+    if route["arm"] == "opus":
+        costs = {"billing": "user-subscription", "cash_cost_usd": 0.0, "api_equivalent_usd": price(raw, route["prices"])}
+    else:
+        costs = {"billing": "subscription", "cash_cost_usd": 0.0, "capacity_allocated_cost_usd": 0.0,
+                 "escalation_api_equivalent_usd": price(child_usage, route["escalate_prices"]) if route.get("escalate") else 0.0}
+    result_grade = grade(task_dir, work)
+    if evidence:
+        result_grade["passed"] = False
+        result_grade["invalid_reason"] = "; ".join(evidence)
+    artifact_path = ECON / "agentic_artifacts" / (stem + "_" + str(int(started.timestamp())))
+    if not secret_hits:
+        shutil.copytree(work, artifact_path)
+    record = {
+        "schema_version": "bench3.economics.agentic.v1", "arm": route["arm"], "harness": "claude-code",
+        "harness_version": subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip(),
+        "catalog_as_of": config["catalog_as_of"], "started_at_utc": started.isoformat(), "route_id": route_id,
+        "route": {key: route[key] for key in ("model_family", "display", "vendor", "route", "provider", "billing")},
+        "model": route["model"], "task": task, "effort": route.get("effort") or effort, "repetition": rep,
+        "condition": "base", "elapsed_seconds": elapsed, "exit_code": exit_code, "timed_out": timed_out,
+        "sandbox_enforced": True, "valid": not evidence, "leak_evidence": evidence, "usage": usage, "costs": costs,
+        "cost_source": "tokens-at-list-price", "parent_models": parsed["models"],
+        "gateway": gw, "escalations": [{k: c.get(k) for k in ("status", "model", "backend", "session", "usage")} for c in children],
+        "escalation_usage": child_usage, "grade": result_grade, "record_path": str(record_path),
+        "log_path": str(log_path), "artifact_path": str(artifact_path),
+    }
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record, indent=1, default=list))
+    print("%s [%s] | %s | pass=%s | valid=%s | %.1fs | %d turns | escalations %d | %s"
+          % (route_id, route["arm"], task, result_grade["passed"], not evidence, elapsed, usage["calls"], len(children),
+             gw["dispatches"] if gw else parsed["models"]))
     return record
 
 

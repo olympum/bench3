@@ -41,20 +41,21 @@ def spent_usd() -> float:
     total = 0.0
     for f in RESULTS.glob("*.json"):
         r = json.loads(f.read_text())
-        if r.get("repetition", 0) > REP_BASE and r["costs"]["billing"] != "subscription":
+        if r.get("repetition", 0) > REP_BASE and r["costs"]["billing"] == "token":
             total += r["costs"]["cash_cost_usd"]
     return total
 
 
 def summary() -> None:
-    rows = defaultdict(lambda: {"runs": 0, "valid": 0, "passed": 0, "usd": 0.0, "lane_s": 0.0, "seconds": []})
+    rows = defaultdict(lambda: {"runs": 0, "valid": 0, "passed": 0, "usd": 0.0, "lane_s": 0.0, "api_eq": 0.0, "seconds": []})
     per_task = defaultdict(dict)
     for f in sorted(RESULTS.glob("*.json")):
         r = json.loads(f.read_text())
         if r.get("repetition", 0) <= REP_BASE or not r["task"].startswith("imported/"):
             continue
         family = r["task"].split("/")[1]
-        key = (family, r["route_id"])
+        route_label = r["route_id"] + (" [claude-code]" if r.get("harness") == "claude-code" else "")
+        key = (family, route_label)
         row = rows[key]
         row["runs"] += 1
         row["valid"] += bool(r["valid"])
@@ -64,17 +65,23 @@ def summary() -> None:
         row["seconds"].append(r["elapsed_seconds"])
         if r["costs"]["billing"] == "subscription":
             row["lane_s"] += r["elapsed_seconds"]
+        elif r["costs"]["billing"] == "user-subscription":
+            row["api_eq"] += r["costs"].get("api_equivalent_usd", 0.0)
+        if r["costs"].get("escalation_api_equivalent_usd"):
+            row["api_eq"] += r["costs"]["escalation_api_equivalent_usd"]
         else:
             row["usd"] += r["costs"]["cash_cost_usd"]
-        cell = per_task[r["task"]].setdefault(r["route_id"], [0, 0])
+        cell = per_task[r["task"]].setdefault(route_label, [0, 0])
         cell[0] += bool(r["grade"].get("passed")); cell[1] += 1
     for (family, route), row in sorted(rows.items()):
         s = sorted(row["seconds"])
-        print("%-14s %-28s runs %2d valid %2d passed %2d  usd %.3f  lane-s %.0f  median-s %.0f"
-              % (family, route, row["runs"], row["valid"], row["passed"], row["usd"], row["lane_s"], s[len(s) // 2]))
+        print("%-14s %-42s runs %2d valid %2d passed %2d  usd %.3f  api-eq %.3f  lane-s %.0f  median-s %.0f"
+              % (family, route, row["runs"], row["valid"], row["passed"], row["usd"], row["api_eq"], row["lane_s"],
+                 s[len(s) // 2] if s else 0))
     print()
     for task, cells in sorted(per_task.items()):
-        label = lambda route_id: route_id.replace("claude-", "").replace("-openrouter", "").replace("-lunaroute", "")
+        label = lambda route_id: (route_id.replace("claude-", "").replace("-openrouter", "").replace("-lunaroute", "")
+                                  .replace("-direct [claude-code]", "/cc-apikey").replace("-claudecode-sub", "/cc-sub").replace("-codex-sub", "/codex-sub").replace(" ", ""))
         print("%-48s %s" % (task, "  ".join("%s %d/%d" % (label(k), v[0], v[1]) for k, v in sorted(cells.items()))))
     print("\ntoken-billed spend in probe records: USD %.3f" % spent_usd())
 
@@ -87,6 +94,7 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=1200)
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--summary", action="store_true")
+    ap.add_argument("--task", action="append", default=[], help="limit to these imported tasks")
     a = ap.parse_args()
     if a.summary:
         summary()
@@ -95,18 +103,19 @@ def main() -> int:
     jobs = []
     for spec in a.route:
         route_id, reps = spec.split(":")
-        for task in imported_tasks(a.family):
+        for task in [t for t in imported_tasks(a.family) if not a.task or t in a.task]:
             for rep in range(1, int(reps) + 1):
                 jobs.append((route_id, task, REP_BASE + rep))
 
     def one(job):
         route_id, task, rep = job
-        token_billed = config["routes"][route_id]["billing"] != "subscription"
+        token_billed = config["routes"][route_id]["billing"] == "token"  # lane plans and user subscriptions cost Mithran nothing per run
         with LOCK:
             if token_billed and spent_usd() >= a.max_usd:
                 print("ceiling reached, skipping %s %s rep %d" % job, flush=True)
                 return
-        stem = "%s_%s_high_rep%d" % (route_id, task.replace("/", "-"), rep)
+        effort = config["routes"][route_id].get("effort") or "high"
+        stem = "%s_%s_%s_rep%d" % (route_id, task.replace("/", "-"), effort, rep)
         prior = RESULTS / (stem + ".json")
         if prior.exists() and json.loads(prior.read_text())["valid"]:
             return
